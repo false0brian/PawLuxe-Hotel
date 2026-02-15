@@ -1,17 +1,49 @@
 # PawLuxe Hotel Backend
 
-FastAPI 기반 반려동물 트래킹/영상 분석 백엔드입니다.
+FastAPI 기반 반려동물 멀티카메라 트래킹/저장/Export 백엔드입니다.
 
-## 반영 내용 (deep-research-report 기반)
-- 카메라 원본 + 메타데이터 분리 저장 구조
-- 동물/목걸이/카메라/트랙/포지션/이벤트/미디어 세그먼트 도메인 모델
-- 크로스카메라 연계를 위한 association 모델 및 API
-- 통합 타임라인(`event + position + video_analysis`) 제공
-- 영상 분석 결과 암호화 저장(Fernet)
-- API Key 인증(`x-api-key`)
+## 현재 동작 방식
+이 레포는 아래 파이프라인으로 동작합니다.
 
-## DB 스키마
-SQLModel 기준 테이블:
+1. 카메라 등록
+- `cameras` 테이블에 카메라 메타데이터(`stream_url`, 설치 정보) 저장
+
+2. 트래킹
+- 업로드 파일 기반: `POST /api/v1/videos/track`
+- RTSP 실시간 기반: `python -m app.workers.rtsp_tracking_worker`
+- 탐지: YOLO(Ultralytics)
+- 추적/ReID: Engine `deep_sort`
+
+3. 저장
+- `tracks`, `track_observations`, `associations` 적재
+- 옵션으로 원본 스트림을 세그먼트 MP4로 저장하고 `media_segments` 적재
+
+4. Export
+- 동기 Export API: `POST /api/v1/exports/global-track/{global_track_id}`
+- Highlights API: `POST /api/v1/exports/global-track/{global_track_id}/highlights`
+- 비동기 잡 큐: `POST /jobs` -> `export_job_worker`가 처리
+- 결과 조회/다운로드: `GET /api/v1/exports/{export_id}`
+
+## 트래킹 ID 정책
+`rtsp_tracking_worker`의 `--global-id-mode`로 결정됩니다.
+
+- `animal`
+: 같은 `animal_id`를 카메라 간 강제 통합 (`global_track_id=animal:<animal_id>`)
+- `camera_track`
+: 카메라 내부 트랙 기준 (`<camera_id>:<source_track_id>`)
+- `reid_auto`
+: ReID 임베딩 코사인 유사도로 카메라 간 자동 통합
+
+## 프로젝트 구조 요약
+- `app/api/routes.py`: API 라우트
+- `app/services/tracking_service.py`: YOLO + DeepSort 추론
+- `app/workers/rtsp_tracking_worker.py`: RTSP 실시간 트래킹 워커
+- `app/workers/multi_camera_tracking_worker.py`: 멀티카메라 워커 런처
+- `app/workers/export_job_worker.py`: 비동기 Export 잡 워커
+- `app/services/export_service.py`: Export 계획/렌더링
+- `app/db/models.py`: SQLModel 스키마
+
+## DB 테이블
 - `animals`
 - `collars`
 - `cameras`
@@ -24,10 +56,11 @@ SQLModel 기준 테이블:
 - `media_segments`
 - `clips`
 - `video_analyses`
+- `export_jobs`
 
 기본 DB는 SQLite(`pawluxe.db`)이며 앱 시작 시 자동 생성됩니다.
 
-## 실행
+## 로컬 실행
 ```bash
 cd /home/brian/PawLuxe-Hotel
 python3 -m venv .venv
@@ -37,14 +70,15 @@ cp .env.example .env
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-YOLO + DeepSort 트래킹까지 사용하려면 추가로 설치:
+트래킹 런타임 의존성:
 ```bash
 pip install -r requirements-tracking.txt
 ```
 
 ## 주요 API
-아래 엔드포인트는 `x-api-key` 헤더가 필요합니다.
+모든 `/api/v1/*`는 `x-api-key` 헤더 필요 (`GET /health` 제외).
 
+기본 도메인:
 - `POST /api/v1/animals`
 - `GET /api/v1/animals`
 - `POST /api/v1/cameras`
@@ -65,64 +99,135 @@ pip install -r requirements-tracking.txt
 - `POST /api/v1/clips`
 - `GET /api/v1/clips`
 - `GET /api/v1/animals/{animal_id}/timeline`
+
+비디오 처리:
 - `POST /api/v1/videos/process`
 - `POST /api/v1/videos/track`
 - `GET /api/v1/videos/{video_id}/analysis`
 
-`GET /health`는 인증 없이 확인 가능합니다.
+Export:
+- `POST /api/v1/exports/global-track/{global_track_id}`
+- `POST /api/v1/exports/global-track/{global_track_id}/highlights`
+- `POST /api/v1/exports/global-track/{global_track_id}/jobs`
+- `GET /api/v1/exports/jobs/{job_id}`
+- `GET /api/v1/exports/{export_id}`
 
-## 암호화 메모
-- `ENCRYPTION_KEY`를 지정하면 해당 키를 우선 사용합니다.
-- 키 형식이 Fernet base64 표준 키가 아니면 passphrase로 간주해 SHA-256으로 파생합니다.
-- `ENCRYPTION_KEY` 미설정 시 `API_KEY` 기반 파생키를 사용합니다(운영에서는 별도 키 권장).
-
-## YOLO + DeepSort 메모
-- `POST /api/v1/videos/track`는 업로드 비디오에서 YOLO 탐지 + Engine의 `deep_sort` ReID를 실행합니다.
-- 기본 `classes_csv`는 COCO 기준 반려동물 클래스 `15,16`(cat,dog)입니다.
-- `ENGINE_ROOT`는 `/mnt/d/99.C-lab/git/Engine`을 기본값으로 사용합니다.
-- `DEEP_SORT_MODEL`은 모델 이름(자동 다운로드) 또는 `.pth` 절대경로를 사용할 수 있습니다.
-
-## RTSP 실시간 워커
-카메라 `stream_url`을 계속 읽어 실시간으로 `tracks`, `track_observations`, `associations`를 적재합니다.
-
-실행 예시:
+## RTSP 워커 실행
 ```bash
-cd /home/brian/PawLuxe-Hotel
-source .venv/bin/activate
 python -m app.workers.rtsp_tracking_worker \
   --camera-id <camera_id> \
-  --animal-id <animal_id> \
   --device cuda:0 \
-  --classes-csv 15,16
+  --global-id-mode reid_auto \
+  --record-segments \
+  --record-dir storage/uploads/segments \
+  --segment-seconds 20
 ```
 
-옵션:
-- `--stream-url`: DB `camera.stream_url` 대신 직접 RTSP URL 지정
-- `--max-frames`: 테스트용으로 프레임 수 제한
-- `--max-seconds`: 테스트용으로 실행 시간 제한
-- `--commit-interval-frames`: DB 커밋 주기(기본 30프레임)
-- `--global-id-mode`: `animal`(기본) 또는 `camera_track`
-  - `animal`: 같은 `animal_id`면 카메라가 달라도 `global_track_id=animal:<animal_id>`로 통합
-  - `camera_track`: `global_track_id=<camera_id>:<source_track_id>`
-  - `reid_auto`: `deep_sort` ReID 임베딩 코사인 유사도로 카메라 간 자동 통합
-- `--reid-match-threshold`: `reid_auto` 매칭 임계값(기본 0.68)
-- `--fallback-animal-id`: `reid_auto`에서 animal 매핑이 없을 때 association 저장용 animal_id
+자주 쓰는 옵션:
+- `--stream-url`: DB `camera.stream_url` 대신 직접 지정
+- `--classes-csv`: 기본 `15,16` (cat,dog)
+- `--reid-match-threshold`: `reid_auto` 임계값
+- `--fallback-animal-id`: `reid_auto`에서 animal 매핑 없을 때 사용
+- `--max-frames`, `--max-seconds`: 테스트 제한
 
-멀티카메라 실행 예시:
+## 멀티카메라 워커 실행
 ```bash
 python -m app.workers.multi_camera_tracking_worker \
-  --camera-ids <camera_id_1>,<camera_id_2> \
-  --camera-animal-map '{"<camera_id_1>":"<animal_id>","<camera_id_2>":"<animal_id>"}' \
-  --device cuda:0 \
-  --global-id-mode animal
-```
-
-animal 맵 없이 ReID 자동 통합:
-```bash
-python -m app.workers.multi_camera_tracking_worker \
-  --camera-ids <camera_id_1>,<camera_id_2> \
+  --camera-ids <cam_id_1>,<cam_id_2> \
   --device cuda:0 \
   --global-id-mode reid_auto \
   --reid-match-threshold 0.68 \
-  --fallback-animal-id system-reid-auto
+  --fallback-animal-id system-reid-auto \
+  --record-segments
 ```
+
+## Export 사용 예
+동기 Export:
+```bash
+curl -X POST "http://localhost:8000/api/v1/exports/global-track/<global_track_id>" \
+  -H "x-api-key: replace-with-strong-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"padding_seconds":3.0,"merge_gap_seconds":0.2,"min_duration_seconds":0.3,"render_video":false}'
+```
+
+Highlights:
+```bash
+curl -X POST "http://localhost:8000/api/v1/exports/global-track/<global_track_id>/highlights" \
+  -H "x-api-key: replace-with-strong-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"padding_seconds":2.0,"target_seconds":30.0,"per_clip_seconds":4.0,"merge_gap_seconds":0.2,"min_duration_seconds":0.3}'
+```
+
+비동기 잡:
+```bash
+# 잡 생성
+curl -X POST "http://localhost:8000/api/v1/exports/global-track/<global_track_id>/jobs" \
+  -H "x-api-key: replace-with-strong-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"mode":"highlights","padding_seconds":2.0,"target_seconds":30.0,"per_clip_seconds":4.0,"render_video":true}'
+
+# 워커 실행
+python -m app.workers.export_job_worker
+
+# 상태 조회
+curl -H "x-api-key: replace-with-strong-api-key" \
+  "http://localhost:8000/api/v1/exports/jobs/<job_id>"
+```
+
+다운로드:
+```bash
+curl -L -H "x-api-key: replace-with-strong-api-key" \
+  "http://localhost:8000/api/v1/exports/<export_id>?download=manifest" -o export.json
+
+curl -L -H "x-api-key: replace-with-strong-api-key" \
+  "http://localhost:8000/api/v1/exports/<export_id>?download=video" -o export.mp4
+```
+
+## systemd 상시 운영
+추가된 파일:
+- `deploy/systemd/pawluxe-rtsp@.service`
+- `deploy/systemd/pawluxe-export-worker.service`
+- `deploy/systemd/rtsp-worker-common.env`
+- `deploy/systemd/rtsp-worker-example.env`
+- `deploy/systemd/install_systemd.sh`
+- `deploy/systemd/smoke_check.sh`
+
+설치:
+```bash
+cd /home/brian/PawLuxe-Hotel
+sudo bash deploy/systemd/install_systemd.sh
+```
+
+설치 스크립트가 현재 사용자와 프로젝트 루트를 자동 인식해 unit 파일에 반영합니다.
+
+카메라 인스턴스 파일:
+```bash
+cp deploy/systemd/rtsp-worker-example.env deploy/systemd/rtsp-worker-cam1.env
+# rtsp-worker-cam1.env에서 CAMERA_ID 수정
+```
+
+서비스 시작:
+```bash
+sudo systemctl enable --now pawluxe-export-worker.service
+sudo systemctl enable --now pawluxe-rtsp@cam1.service
+```
+
+로그:
+```bash
+journalctl -u pawluxe-export-worker.service -f
+journalctl -u pawluxe-rtsp@cam1.service -f
+```
+
+스모크 체크:
+```bash
+sudo bash deploy/systemd/smoke_check.sh --instance cam1
+```
+옵션:
+- `--restart`: 체크 전에 서비스 재시작
+- `--follow-logs`: 마지막 로그 출력 후 tail 모드 진입
+
+## 운영상 주의사항
+- SQLite는 단일 노드/중소 트래픽에는 적합하지만, 워커 수가 늘어나면 Postgres 전환 권장.
+- `reid_auto`는 완전 무오류가 아니므로 임계값/카메라 배치/조명 조건 튜닝 필요.
+- `render_video=true`는 ffmpeg CPU 사용량이 커서 비동기 잡 워커로 처리 권장.
+- 카메라 시간 동기(NTP/PTP)가 맞지 않으면 cross-camera ID 품질이 크게 떨어질 수 있음.

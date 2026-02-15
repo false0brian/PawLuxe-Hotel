@@ -3,12 +3,15 @@ import json
 import time
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 
 import cv2
 import numpy as np
 from sqlmodel import Session, select
 
+from app.core.config import settings
 from app.db.models import Animal, Association, Camera, GlobalTrackProfile, Track, TrackObservation, utcnow
+from app.db.models import MediaSegment
 from app.db.session import engine
 from app.services.tracking_service import YoloDeepSortTracker
 
@@ -17,6 +20,63 @@ from app.services.tracking_service import YoloDeepSortTracker
 class ActiveTrack:
     track_id: str
     association_created: bool = False
+
+
+@dataclass
+class SegmentRecorder:
+    camera_id: str
+    base_dir: Path
+    segment_seconds: int
+    fps: float
+    frame_size: tuple[int, int]
+    codec: str = "mp4v"
+    writer: cv2.VideoWriter | None = None
+    segment_path: Path | None = None
+    segment_start: object | None = None
+
+    def _build_path(self, now) -> Path:
+        day = now.strftime("%Y%m%d")
+        hour = now.strftime("%H")
+        root = self.base_dir / self.camera_id / day / hour
+        root.mkdir(parents=True, exist_ok=True)
+        filename = now.strftime("%Y%m%dT%H%M%S") + ".mp4"
+        return root / filename
+
+    def _open_writer(self, now) -> None:
+        self.segment_path = self._build_path(now)
+        fourcc = cv2.VideoWriter_fourcc(*self.codec)
+        self.writer = cv2.VideoWriter(
+            str(self.segment_path),
+            fourcc,
+            max(self.fps, 1.0),
+            self.frame_size,
+        )
+        self.segment_start = now
+
+    def write(self, frame, now):
+        if self.writer is None:
+            self._open_writer(now)
+        assert self.writer is not None
+        self.writer.write(frame)
+
+        elapsed = (now - self.segment_start).total_seconds() if self.segment_start else 0.0
+        if elapsed >= self.segment_seconds:
+            return self.flush(now)
+        return None
+
+    def flush(self, now):
+        if self.writer is None or self.segment_path is None or self.segment_start is None:
+            return None
+        self.writer.release()
+        finished = {
+            "path": str(self.segment_path),
+            "start_ts": self.segment_start,
+            "end_ts": now,
+        }
+        self.writer = None
+        self.segment_path = None
+        self.segment_start = None
+        return finished
 
 
 def _build_global_track_id(global_id_mode: str, camera_id: str, source_track_id: int, animal_id: str) -> str:
@@ -139,6 +199,23 @@ def run(args: argparse.Namespace) -> None:
         if args.global_id_mode == "reid_auto":
             _ensure_animal_exists(session, args.animal_id or fallback_animal_id)
         cap = _open_capture_with_retry(stream_url, args.reconnect_retries, args.reconnect_delay_seconds)
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 15.0)
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+
+        recorder = None
+        if args.record_segments:
+            if width <= 0 or height <= 0:
+                raise RuntimeError("Failed to determine stream frame size for recording")
+            record_root = Path(args.record_dir).expanduser()
+            recorder = SegmentRecorder(
+                camera_id=args.camera_id,
+                base_dir=record_root,
+                segment_seconds=max(args.segment_seconds, 5),
+                fps=max(fps, 1.0),
+                frame_size=(width, height),
+                codec=args.record_codec,
+            )
 
         frame_index = 0
         processed_frames = 0
@@ -163,6 +240,18 @@ def run(args: argparse.Namespace) -> None:
                     continue
 
                 now = utcnow()
+                if recorder is not None:
+                    finished = recorder.write(frame=frame, now=now)
+                    if finished:
+                        session.add(
+                            MediaSegment(
+                                camera_id=args.camera_id,
+                                start_ts=finished["start_ts"],
+                                end_ts=finished["end_ts"],
+                                path=finished["path"],
+                                codec="video/mp4",
+                            )
+                        )
                 detections = runtime.process_frame(
                     frame=frame,
                     conf_threshold=args.conf_threshold,
@@ -257,6 +346,18 @@ def run(args: argparse.Namespace) -> None:
         except KeyboardInterrupt:
             pass
         finally:
+            if recorder is not None:
+                finished = recorder.flush(utcnow())
+                if finished:
+                    session.add(
+                        MediaSegment(
+                            camera_id=args.camera_id,
+                            start_ts=finished["start_ts"],
+                            end_ts=finished["end_ts"],
+                            path=finished["path"],
+                            codec="video/mp4",
+                        )
+                    )
             session.commit()
             cap.release()
 
@@ -289,6 +390,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reconnect-delay-seconds", type=float, default=2.0)
     parser.add_argument("--max-frames", type=int, default=0)
     parser.add_argument("--max-seconds", type=int, default=0)
+    parser.add_argument("--record-segments", action="store_true", help="Record raw stream into rotating local mp4 segments")
+    parser.add_argument("--record-dir", default=str(settings.upload_dir / "segments"), help="Base directory for recorded segments")
+    parser.add_argument("--segment-seconds", type=int, default=20, help="Duration of each recorded segment")
+    parser.add_argument("--record-codec", default="mp4v", help="OpenCV fourcc codec for recording")
     parser.add_argument(
         "--global-id-mode",
         choices=["animal", "camera_track", "reid_auto"],

@@ -10,6 +10,8 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./pawluxe.db"
     upload_dir: Path = Path("storage/uploads")
     encrypted_dir: Path = Path("storage/encrypted")
+    export_dir: Path = Path("storage/exports")
+    ffmpeg_bin: str = "ffmpeg"
 
     # Tracking runtime settings.
     tracking_device: str = "cuda:0"

@@ -81,3 +81,28 @@ class ClipCreate(BaseModel):
     start_ts: datetime | None = None
     end_ts: datetime | None = None
     derived_from_segments: str | None = None
+
+
+class ExportRequest(BaseModel):
+    padding_seconds: float = 3.0
+    merge_gap_seconds: float = 0.2
+    min_duration_seconds: float = 0.3
+    render_video: bool = False
+
+
+class HighlightRequest(BaseModel):
+    padding_seconds: float = 2.0
+    target_seconds: float = 30.0
+    per_clip_seconds: float = 4.0
+    merge_gap_seconds: float = 0.2
+    min_duration_seconds: float = 0.3
+
+
+class ExportJobCreate(BaseModel):
+    mode: str = "full"  # full | highlights
+    padding_seconds: float = 3.0
+    merge_gap_seconds: float = 0.2
+    min_duration_seconds: float = 0.3
+    render_video: bool = True
+    target_seconds: float = 30.0
+    per_clip_seconds: float = 4.0

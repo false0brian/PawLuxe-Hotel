@@ -1,4 +1,5 @@
 import uuid
+from datetime import datetime, timedelta, timezone
 
 from fastapi.testclient import TestClient
 
@@ -45,7 +46,12 @@ def test_domain_flow_and_timeline() -> None:
 
     track_resp = client.post(
         "/api/v1/tracks",
-        json={"camera_id": camera_id, "quality_score": 0.92},
+        json={
+            "camera_id": camera_id,
+            "quality_score": 0.92,
+            "start_ts": (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat(),
+            "end_ts": (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat(),
+        },
         headers=HEADERS,
     )
     assert track_resp.status_code == 200
@@ -59,10 +65,11 @@ def test_domain_flow_and_timeline() -> None:
     assert observation_resp.status_code == 200
     assert observation_resp.json()["track_id"] == track_id
 
+    association_global_track_id = f"global-{suffix}"
     association_resp = client.post(
         "/api/v1/associations",
         json={
-            "global_track_id": f"global-{suffix}",
+            "global_track_id": association_global_track_id,
             "track_id": track_id,
             "animal_id": animal_id,
             "confidence": 0.95,
@@ -93,6 +100,8 @@ def test_domain_flow_and_timeline() -> None:
             "path": f"storage/uploads/{suffix}.mp4",
             "codec": "video/mp4",
             "avg_bitrate": 850.5,
+            "start_ts": (datetime.now(timezone.utc) - timedelta(seconds=60)).isoformat(),
+            "end_ts": (datetime.now(timezone.utc) + timedelta(seconds=120)).isoformat(),
         },
         headers=HEADERS,
     )
@@ -126,3 +135,42 @@ def test_domain_flow_and_timeline() -> None:
     )
     assert observations_resp.status_code == 200
     assert len(observations_resp.json()) >= 1
+
+    export_resp = client.post(
+        f"/api/v1/exports/global-track/{association_global_track_id}",
+        json={"padding_seconds": 2.0, "render_video": False},
+        headers=HEADERS,
+    )
+    assert export_resp.status_code == 200
+    export_body = export_resp.json()
+    assert export_body["global_track_id"] == association_global_track_id
+    assert export_body["manifest_path"].endswith(".json")
+
+    highlight_resp = client.post(
+        f"/api/v1/exports/global-track/{association_global_track_id}/highlights",
+        json={"padding_seconds": 1.0, "target_seconds": 10.0, "per_clip_seconds": 2.0},
+        headers=HEADERS,
+    )
+    assert highlight_resp.status_code == 200
+    highlight_body = highlight_resp.json()
+    assert highlight_body["summary"]["mode"] == "highlights"
+    assert highlight_body["manifest_path"].endswith(".json")
+
+    job_resp = client.post(
+        f"/api/v1/exports/global-track/{association_global_track_id}/jobs",
+        json={
+            "mode": "highlights",
+            "padding_seconds": 1.0,
+            "target_seconds": 8.0,
+            "per_clip_seconds": 2.0,
+            "render_video": False,
+        },
+        headers=HEADERS,
+    )
+    assert job_resp.status_code == 200
+    job_id = job_resp.json()["job_id"]
+    assert job_resp.json()["status"] == "pending"
+
+    job_get_resp = client.get(f"/api/v1/exports/jobs/{job_id}", headers=HEADERS)
+    assert job_get_resp.status_code == 200
+    assert job_get_resp.json()["job_id"] == job_id

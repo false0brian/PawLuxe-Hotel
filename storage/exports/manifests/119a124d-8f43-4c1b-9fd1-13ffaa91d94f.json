@@ -1,0 +1,28 @@
+{
+  "export_id": "119a124d-8f43-4c1b-9fd1-13ffaa91d94f",
+  "global_track_id": "job-global-f9cf6b61-f2e9-4bd2-a05f-d413a89ea841",
+  "created_at": "2026-02-15T05:39:16.565283+00:00",
+  "summary": {
+    "global_track_id": "job-global-f9cf6b61-f2e9-4bd2-a05f-d413a89ea841",
+    "padding_seconds": 1.0,
+    "merge_gap_seconds": 0.2,
+    "min_duration_seconds": 0.3,
+    "association_count": 1,
+    "excerpt_count": 1,
+    "mode": "highlights",
+    "target_seconds": 8.0,
+    "per_clip_seconds": 2.0,
+    "highlight_excerpt_count": 1
+  },
+  "excerpts": [
+    {
+      "camera_id": "camera-ede81939",
+      "segment_id": "7ba50e15-fea5-4b3c-a2ef-225589ac7b2e",
+      "segment_path": "storage/uploads/seed-ede81939.mp4",
+      "clip_start_ts": "2026-02-15T05:38:55.556954",
+      "clip_end_ts": "2026-02-15T05:38:57.556954",
+      "offset_start_sec": 39.0,
+      "duration_sec": 2.0
+    }
+  ]
+}

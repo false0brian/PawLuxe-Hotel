@@ -5,6 +5,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Iterable
+from pathlib import Path
 
 
 def _parse_csv(values: str) -> list[str]:
@@ -64,6 +65,18 @@ def _start_worker(
         "--fallback-animal-id",
         args.fallback_animal_id,
     ]
+    if args.record_segments:
+        cmd.extend(
+            [
+                "--record-segments",
+                "--record-dir",
+                args.record_dir,
+                "--segment-seconds",
+                str(args.segment_seconds),
+                "--record-codec",
+                args.record_codec,
+            ]
+        )
 
     if animal_id:
         cmd.extend(["--animal-id", animal_id])
@@ -135,6 +148,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reconnect-delay-seconds", type=float, default=2.0)
     parser.add_argument("--max-frames", type=int, default=0)
     parser.add_argument("--max-seconds", type=int, default=0)
+    parser.add_argument("--record-segments", action="store_true")
+    parser.add_argument("--record-dir", default=str(Path("storage/uploads/segments")))
+    parser.add_argument("--segment-seconds", type=int, default=20)
+    parser.add_argument("--record-codec", default="mp4v")
     parser.add_argument(
         "--global-id-mode",
         choices=["animal", "camera_track", "reid_auto"],

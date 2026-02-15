@@ -1,0 +1,24 @@
+{
+  "export_id": "f55d7a65-57a1-476f-b127-400da859a8d7",
+  "global_track_id": "global-47588cb1",
+  "created_at": "2026-02-15T05:58:53.671922+00:00",
+  "summary": {
+    "global_track_id": "global-47588cb1",
+    "padding_seconds": 2.0,
+    "merge_gap_seconds": 0.2,
+    "min_duration_seconds": 0.3,
+    "association_count": 1,
+    "excerpt_count": 1
+  },
+  "excerpts": [
+    {
+      "camera_id": "a227b8ec-2846-431d-9eaf-fc7b0f055054",
+      "segment_id": "110ca614-99fb-43cf-a3a2-20ad33c619d5",
+      "segment_path": "storage/uploads/47588cb1.mp4",
+      "clip_start_ts": "2026-02-15T05:58:21.531198",
+      "clip_end_ts": "2026-02-15T05:58:50.531213",
+      "offset_start_sec": 27.906,
+      "duration_sec": 29.0
+    }
+  ]
+}

@@ -149,3 +149,20 @@ class VideoAnalysis(SQLModel, table=True):
     avg_motion_score: float
     avg_brightness: float
     created_at: datetime = Field(default_factory=utcnow, index=True)
+
+
+class ExportJob(SQLModel, table=True):
+    __tablename__ = "export_jobs"
+
+    job_id: str = Field(default_factory=lambda: str(uuid.uuid4()), primary_key=True)
+    global_track_id: str = Field(index=True)
+    mode: str = Field(default="full")  # full | highlights
+    status: str = Field(default="pending", index=True)  # pending | running | done | failed
+    payload_json: str
+    export_id: str | None = Field(default=None, index=True)
+    manifest_path: str | None = None
+    video_path: str | None = None
+    error_message: str | None = None
+    created_at: datetime = Field(default_factory=utcnow, index=True)
+    started_at: datetime | None = None
+    finished_at: datetime | None = None

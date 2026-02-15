@@ -3,6 +3,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi.responses import FileResponse
 from sqlmodel import Session, select
 
 from app.core.auth import verify_api_key
@@ -13,6 +14,7 @@ from app.db.models import (
     Clip,
     Collar,
     Event,
+    ExportJob,
     MediaSegment,
     Position,
     Track,
@@ -28,10 +30,22 @@ from app.schemas.domain import (
     ClipCreate,
     CollarCreate,
     EventCreate,
+    ExportJobCreate,
+    ExportRequest,
+    HighlightRequest,
     MediaSegmentCreate,
     PositionCreate,
     TrackCreate,
     TrackObservationCreate,
+)
+from app.services.export_service import (
+    build_export_plan,
+    build_highlight_plan,
+    load_manifest,
+    manifest_path_for_export,
+    render_export_video,
+    save_manifest,
+    video_path_for_export,
 )
 from app.services.storage_service import (
     read_encrypted_analysis,
@@ -584,4 +598,171 @@ def get_analysis(video_id: str, session: Session = Depends(get_session)) -> dict
     return {
         "metadata": row,
         "analysis": decrypted,
+    }
+
+
+@router.post("/exports/global-track/{global_track_id}")
+def export_global_track(
+    global_track_id: str,
+    payload: ExportRequest,
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    try:
+        excerpts, summary = build_export_plan(
+            session=session,
+            global_track_id=global_track_id,
+            padding_seconds=payload.padding_seconds,
+            merge_gap_seconds=payload.merge_gap_seconds,
+            min_duration_seconds=payload.min_duration_seconds,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    export_id, manifest_path = save_manifest(
+        global_track_id=global_track_id,
+        summary=summary,
+        excerpts=excerpts,
+    )
+
+    video_path: str | None = None
+    render_error: str | None = None
+    if payload.render_video:
+        try:
+            video_path = str(render_export_video(export_id=export_id, excerpts=excerpts))
+        except Exception as exc:
+            render_error = str(exc)
+
+    return {
+        "export_id": export_id,
+        "global_track_id": global_track_id,
+        "summary": summary,
+        "manifest_path": str(manifest_path),
+        "video_path": video_path,
+        "render_error": render_error,
+    }
+
+
+@router.post("/exports/global-track/{global_track_id}/highlights")
+def export_global_track_highlights(
+    global_track_id: str,
+    payload: HighlightRequest,
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    try:
+        excerpts, summary = build_export_plan(
+            session=session,
+            global_track_id=global_track_id,
+            padding_seconds=payload.padding_seconds,
+            merge_gap_seconds=payload.merge_gap_seconds,
+            min_duration_seconds=payload.min_duration_seconds,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    highlights = build_highlight_plan(
+        excerpts=excerpts,
+        target_seconds=payload.target_seconds,
+        per_clip_seconds=payload.per_clip_seconds,
+    )
+    if not highlights:
+        raise HTTPException(status_code=404, detail="No highlight excerpts available")
+
+    summary["mode"] = "highlights"
+    summary["target_seconds"] = payload.target_seconds
+    summary["per_clip_seconds"] = payload.per_clip_seconds
+    summary["highlight_excerpt_count"] = len(highlights)
+
+    export_id, manifest_path = save_manifest(
+        global_track_id=global_track_id,
+        summary=summary,
+        excerpts=highlights,
+    )
+
+    video_path: str | None = None
+    render_error: str | None = None
+    try:
+        video_path = str(render_export_video(export_id=export_id, excerpts=highlights))
+    except Exception as exc:
+        render_error = str(exc)
+
+    return {
+        "export_id": export_id,
+        "global_track_id": global_track_id,
+        "summary": summary,
+        "manifest_path": str(manifest_path),
+        "video_path": video_path,
+        "render_error": render_error,
+    }
+
+
+@router.post("/exports/global-track/{global_track_id}/jobs")
+def create_export_job(
+    global_track_id: str,
+    payload: ExportJobCreate,
+    session: Session = Depends(get_session),
+) -> ExportJob:
+    mode = payload.mode.strip().lower()
+    if mode not in {"full", "highlights"}:
+        raise HTTPException(status_code=400, detail="mode must be one of: full, highlights")
+
+    job = ExportJob(
+        global_track_id=global_track_id,
+        mode=mode,
+        status="pending",
+        payload_json=json.dumps(payload.model_dump(), ensure_ascii=True),
+    )
+    session.add(job)
+    session.commit()
+    session.refresh(job)
+    return job
+
+
+@router.get("/exports/jobs/{job_id}")
+def get_export_job(job_id: str, session: Session = Depends(get_session)) -> ExportJob:
+    job = session.get(ExportJob, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Export job not found")
+    return job
+
+
+@router.get("/exports/{export_id}")
+def get_export(
+    export_id: str,
+    download: str | None = Query(default=None),
+) -> Any:
+    manifest_path = manifest_path_for_export(export_id)
+    video_path = video_path_for_export(export_id)
+
+    if download:
+        kind = download.strip().lower()
+        if kind == "manifest":
+            if not manifest_path.exists():
+                raise HTTPException(status_code=404, detail="Manifest not found")
+            return FileResponse(
+                path=str(manifest_path),
+                media_type="application/json",
+                filename=f"{export_id}.json",
+            )
+        if kind == "video":
+            if not video_path.exists():
+                raise HTTPException(status_code=404, detail="Video not found")
+            return FileResponse(
+                path=str(video_path),
+                media_type="video/mp4",
+                filename=f"{export_id}.mp4",
+            )
+        raise HTTPException(status_code=400, detail="download must be one of: manifest, video")
+
+    manifest_data = None
+    if manifest_path.exists():
+        try:
+            manifest_data = load_manifest(export_id)
+        except Exception:
+            manifest_data = None
+
+    return {
+        "export_id": export_id,
+        "manifest_path": str(manifest_path) if manifest_path.exists() else None,
+        "video_path": str(video_path) if video_path.exists() else None,
+        "manifest": manifest_data,
     }

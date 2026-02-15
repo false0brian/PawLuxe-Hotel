@@ -19,6 +19,9 @@ CLASSES_CSV="${CLASSES_CSV:-15,16}"
 FRAME_STRIDE="${FRAME_STRIDE:-1}"
 REID_MATCH_THRESHOLD="${REID_MATCH_THRESHOLD:-0.68}"
 FALLBACK_ANIMAL_ID="${FALLBACK_ANIMAL_ID:-system-reid-auto}"
+RECORD_SEGMENTS="${RECORD_SEGMENTS:-1}"
+RECORD_DIR="${RECORD_DIR:-storage/uploads/segments}"
+SEGMENT_SECONDS="${SEGMENT_SECONDS:-20}"
 
 if [[ -z "$CAM1_RTSP" || -z "$CAM2_RTSP" ]]; then
   echo "[ERROR] CAM1_RTSP and CAM2_RTSP are required." >&2
@@ -62,13 +65,20 @@ echo "[2/3] Installing tracking extras (if needed)..."
 .venv/bin/pip -q install -r requirements-tracking.txt
 
 echo "[3/3] Starting multi-camera worker (reid_auto)..."
-exec .venv/bin/python -m app.workers.multi_camera_tracking_worker \
-  --camera-ids "$CAM1_ID,$CAM2_ID" \
-  --device "$DEVICE" \
-  --conf-threshold "$CONF_THRESHOLD" \
-  --iou-threshold "$IOU_THRESHOLD" \
-  --classes-csv "$CLASSES_CSV" \
-  --frame-stride "$FRAME_STRIDE" \
-  --global-id-mode reid_auto \
-  --reid-match-threshold "$REID_MATCH_THRESHOLD" \
+CMD=(.venv/bin/python -m app.workers.multi_camera_tracking_worker
+  --camera-ids "$CAM1_ID,$CAM2_ID"
+  --device "$DEVICE"
+  --conf-threshold "$CONF_THRESHOLD"
+  --iou-threshold "$IOU_THRESHOLD"
+  --classes-csv "$CLASSES_CSV"
+  --frame-stride "$FRAME_STRIDE"
+  --global-id-mode reid_auto
+  --reid-match-threshold "$REID_MATCH_THRESHOLD"
   --fallback-animal-id "$FALLBACK_ANIMAL_ID"
+)
+
+if [[ "$RECORD_SEGMENTS" == "1" ]]; then
+  CMD+=(--record-segments --record-dir "$RECORD_DIR" --segment-seconds "$SEGMENT_SECONDS")
+fi
+
+exec "${CMD[@]}"

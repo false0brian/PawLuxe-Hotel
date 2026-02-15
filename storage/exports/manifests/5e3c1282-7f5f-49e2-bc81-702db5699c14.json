@@ -1,0 +1,24 @@
+{
+  "export_id": "5e3c1282-7f5f-49e2-bc81-702db5699c14",
+  "global_track_id": "exp-a630ab22",
+  "created_at": "2026-02-15T05:25:08.932254+00:00",
+  "summary": {
+    "global_track_id": "exp-a630ab22",
+    "padding_seconds": 1.0,
+    "merge_gap_seconds": 0.2,
+    "min_duration_seconds": 0.3,
+    "association_count": 1,
+    "excerpt_count": 1
+  },
+  "excerpts": [
+    {
+      "camera_id": "2a2b2f2a-e651-4449-b99d-abe567540bb3",
+      "segment_id": "018d299a-006b-4d72-b181-3fa1c35b0a7b",
+      "segment_path": "storage/uploads/a630ab22.mp4",
+      "clip_start_ts": "2026-02-15T05:24:37.901378",
+      "clip_end_ts": "2026-02-15T05:24:59.901392",
+      "offset_start_sec": 28.981,
+      "duration_sec": 22.0
+    }
+  ]
+}
