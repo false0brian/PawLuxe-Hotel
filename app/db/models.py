@@ -88,6 +88,16 @@ class Association(SQLModel, table=True):
     created_at: datetime = Field(default_factory=utcnow)
 
 
+class GlobalTrackProfile(SQLModel, table=True):
+    __tablename__ = "global_track_profiles"
+
+    global_track_id: str = Field(primary_key=True)
+    class_id: int = Field(index=True)
+    embedding_json: str
+    sample_count: int = 1
+    updated_at: datetime = Field(default_factory=utcnow, index=True)
+
+
 class Event(SQLModel, table=True):
     __tablename__ = "events"
 

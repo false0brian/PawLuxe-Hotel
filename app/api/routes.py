@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -37,6 +38,7 @@ from app.services.storage_service import (
     save_upload,
     store_encrypted_analysis,
 )
+from app.services.tracking_service import track_video_with_yolo_deepsort
 from app.services.video_service import analyze_video
 
 router = APIRouter(dependencies=[Depends(verify_api_key)])
@@ -48,6 +50,12 @@ def _timeline_item(kind: str, ts: datetime, payload: Any) -> dict[str, Any]:
         "ts": ts,
         "data": payload.model_dump() if hasattr(payload, "model_dump") else payload,
     }
+
+
+def _build_global_track_id(global_id_mode: str, camera_id: str, source_track_id: int, animal_id: str | None) -> str:
+    if global_id_mode == "animal" and animal_id:
+        return f"animal:{animal_id}"
+    return f"{camera_id}:{source_track_id}"
 
 
 @router.post("/animals")
@@ -408,6 +416,156 @@ async def process_video(
             "sampled_frames": analysis["sampled_frames"],
             "avg_motion_score": analysis["avg_motion_score"],
             "avg_brightness": analysis["avg_brightness"],
+        },
+    }
+
+
+@router.post("/videos/track")
+async def track_video(
+    file: UploadFile = File(...),
+    camera_id: str = Form(...),
+    animal_id: str | None = Form(default=None),
+    conf_threshold: float = Form(default=0.25),
+    iou_threshold: float = Form(default=0.45),
+    frame_stride: int = Form(default=1),
+    max_frames: int = Form(default=0),
+    classes_csv: str = Form(default="15,16"),
+    global_id_mode: str = Form(default="animal"),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="File name is required")
+
+    if not file.content_type or not file.content_type.startswith("video/"):
+        raise HTTPException(status_code=400, detail="Only video files are allowed")
+
+    camera = session.get(Camera, camera_id)
+    if not camera:
+        raise HTTPException(status_code=404, detail="Camera not found")
+
+    if animal_id and not session.get(Animal, animal_id):
+        raise HTTPException(status_code=404, detail="Animal not found")
+
+    if frame_stride < 1:
+        raise HTTPException(status_code=400, detail="frame_stride must be >= 1")
+    if global_id_mode not in {"animal", "camera_track"}:
+        raise HTTPException(status_code=400, detail="global_id_mode must be one of: animal, camera_track")
+
+    classes: list[int] | None = None
+    classes_csv = classes_csv.strip()
+    if classes_csv:
+        try:
+            classes = [int(value.strip()) for value in classes_csv.split(",") if value.strip()]
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="classes_csv must be comma-separated integers") from exc
+
+    video_id, video_path = await save_upload(file)
+
+    try:
+        tracking = track_video_with_yolo_deepsort(
+            video_path=video_path,
+            conf_threshold=conf_threshold,
+            iou_threshold=iou_threshold,
+            frame_stride=frame_stride,
+            max_frames=max_frames,
+            classes=classes,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    now = utcnow()
+    analysis_row = VideoAnalysis(
+        video_id=video_id,
+        animal_id=animal_id,
+        camera_id=camera_id,
+        filename=file.filename,
+        uploaded_path=str(video_path),
+        encrypted_analysis_path="",
+        duration_seconds=float(tracking["duration_seconds"]),
+        fps=float(tracking["fps"]),
+        total_frames=int(tracking["total_frames"]),
+        sampled_frames=int(tracking["processed_frames"]),
+        avg_motion_score=0.0,
+        avg_brightness=0.0,
+        created_at=now,
+    )
+    session.add(analysis_row)
+
+    segment = MediaSegment(
+        camera_id=camera_id,
+        start_ts=now,
+        end_ts=now + timedelta(seconds=float(tracking["duration_seconds"])),
+        path=str(video_path),
+        codec=file.content_type,
+    )
+    session.add(segment)
+
+    persisted_tracks = 0
+    persisted_observations = 0
+    persisted_associations = 0
+    for source_track in tracking["tracks"]:
+        observations = source_track["observations"]
+        if not observations:
+            continue
+
+        start_ts = now + timedelta(seconds=float(observations[0]["ts_seconds"]))
+        end_ts = now + timedelta(seconds=float(observations[-1]["ts_seconds"]))
+        track_row = Track(
+            camera_id=camera_id,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            quality_score=float(source_track["avg_confidence"]),
+        )
+        session.add(track_row)
+        session.flush()
+        persisted_tracks += 1
+
+        for obs in observations:
+            bbox_json = json.dumps([round(float(v), 3) for v in obs["bbox_xyxy"]], ensure_ascii=True)
+            appearance_ref = f"class:{int(obs['class_id'])};conf:{float(obs['conf']):.6f}"
+            row = TrackObservation(
+                track_id=track_row.track_id,
+                ts=now + timedelta(seconds=float(obs["ts_seconds"])),
+                bbox=bbox_json,
+                marker_id_read=None,
+                appearance_vec_ref=appearance_ref,
+            )
+            session.add(row)
+            persisted_observations += 1
+
+        if animal_id:
+            association = Association(
+                global_track_id=_build_global_track_id(
+                    global_id_mode,
+                    camera_id,
+                    int(source_track["source_track_id"]),
+                    animal_id,
+                ),
+                track_id=track_row.track_id,
+                animal_id=animal_id,
+                confidence=float(source_track["avg_confidence"]),
+            )
+            session.add(association)
+            persisted_associations += 1
+
+    session.commit()
+
+    return {
+        "video_id": video_id,
+        "camera_id": camera_id,
+        "animal_id": animal_id,
+        "tracking_summary": {
+            "fps": tracking["fps"],
+            "total_frames": tracking["total_frames"],
+            "processed_frames": tracking["processed_frames"],
+            "duration_seconds": tracking["duration_seconds"],
+            "total_detections": tracking["total_detections"],
+            "track_count": tracking["track_count"],
+        },
+        "db_persisted": {
+            "tracks": persisted_tracks,
+            "observations": persisted_observations,
+            "associations": persisted_associations,
         },
     }
 
