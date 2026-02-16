@@ -98,6 +98,17 @@ class GlobalTrackProfile(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=utcnow, index=True)
 
 
+class GlobalIdentity(SQLModel, table=True):
+    __tablename__ = "global_identities"
+
+    global_track_id: str = Field(primary_key=True)
+    animal_id: str | None = Field(default=None, foreign_key="animals.animal_id", index=True)
+    state: str = Field(default="unknown", index=True)  # unknown | confirmed
+    source: str = Field(default="reid_auto")  # reid_auto | manual | marker
+    last_confidence: float | None = None
+    updated_at: datetime = Field(default_factory=utcnow, index=True)
+
+
 class Event(SQLModel, table=True):
     __tablename__ = "events"
 
@@ -157,8 +168,12 @@ class ExportJob(SQLModel, table=True):
     job_id: str = Field(default_factory=lambda: str(uuid.uuid4()), primary_key=True)
     global_track_id: str = Field(index=True)
     mode: str = Field(default="full")  # full | highlights
-    status: str = Field(default="pending", index=True)  # pending | running | done | failed
+    status: str = Field(default="pending", index=True)  # pending | running | done | failed | canceled
     payload_json: str
+    retry_count: int = 0
+    max_retries: int = 3
+    next_run_at: datetime | None = Field(default_factory=utcnow, index=True)
+    canceled_at: datetime | None = None
     export_id: str | None = Field(default=None, index=True)
     manifest_path: str | None = None
     video_path: str | None = None

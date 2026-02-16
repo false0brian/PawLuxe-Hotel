@@ -10,7 +10,7 @@ import numpy as np
 from sqlmodel import Session, select
 
 from app.core.config import settings
-from app.db.models import Animal, Association, Camera, GlobalTrackProfile, Track, TrackObservation, utcnow
+from app.db.models import Animal, Association, Camera, GlobalIdentity, GlobalTrackProfile, Track, TrackObservation, utcnow
 from app.db.models import MediaSegment
 from app.db.session import engine
 from app.services.tracking_service import YoloDeepSortTracker
@@ -19,6 +19,9 @@ from app.services.tracking_service import YoloDeepSortTracker
 @dataclass
 class ActiveTrack:
     track_id: str
+    track_row: Track
+    last_seen_frame: int
+    observation_count: int = 0
     association_created: bool = False
 
 
@@ -162,6 +165,38 @@ def _ensure_animal_exists(session: Session, animal_id: str) -> None:
     session.flush()
 
 
+def _upsert_identity(
+    session: Session,
+    global_track_id: str,
+    animal_id: str | None,
+    source: str,
+    confidence: float | None,
+) -> None:
+    row = session.get(GlobalIdentity, global_track_id)
+    if row is None:
+        row = GlobalIdentity(
+            global_track_id=global_track_id,
+            animal_id=animal_id,
+            state="confirmed" if animal_id else "unknown",
+            source=source,
+            last_confidence=confidence,
+            updated_at=utcnow(),
+        )
+        session.add(row)
+        return
+
+    # Keep confirmed mapping unless explicitly replaced by known animal.
+    if animal_id:
+        row.animal_id = animal_id
+        row.state = "confirmed"
+    elif row.animal_id is None:
+        row.state = "unknown"
+    row.source = source
+    row.last_confidence = confidence
+    row.updated_at = utcnow()
+    session.add(row)
+
+
 def _parse_classes(classes_csv: str) -> list[int] | None:
     raw = classes_csv.strip()
     if not raw:
@@ -185,6 +220,9 @@ def run(args: argparse.Namespace) -> None:
     classes = _parse_classes(args.classes_csv)
     started_at = utcnow()
     fallback_animal_id = args.fallback_animal_id.strip() or "system-reid-auto"
+    observation_stride = max(int(getattr(args, "observation_stride", 1)), 1)
+    min_track_observations = max(int(getattr(args, "min_track_observations", 1)), 1)
+    track_stale_frames = int(getattr(args, "track_stale_frames", 0))
 
     with Session(engine) as session:
         camera = session.get(Camera, args.camera_id)
@@ -271,44 +309,67 @@ def run(args: argparse.Namespace) -> None:
                         )
                         session.add(row)
                         session.flush()
-                        active = ActiveTrack(track_id=row.track_id)
+                        active = ActiveTrack(track_id=row.track_id, track_row=row, last_seen_frame=frame_index)
                         active_tracks[source_track_id] = active
                         total_tracks_written += 1
 
-                    track_row = session.get(Track, active.track_id)
-                    if track_row:
-                        track_row.end_ts = now
-                        prev = float(track_row.quality_score or 0.0)
-                        track_row.quality_score = round((prev + float(det["conf"])) / 2.0, 6)
+                    track_row = active.track_row
+                    active.last_seen_frame = frame_index
+                    track_row.end_ts = now
+                    prev = float(track_row.quality_score or 0.0)
+                    track_row.quality_score = round((prev + float(det["conf"])) / 2.0, 6)
+                    session.add(track_row)
 
-                    obs = TrackObservation(
-                        track_id=active.track_id,
-                        ts=now,
-                        bbox=json.dumps([round(float(v), 3) for v in det["bbox_xyxy"]], ensure_ascii=True),
-                        marker_id_read=None,
-                        appearance_vec_ref=(
-                            f"src:{source_track_id};class:{int(det['class_id'])};conf:{float(det['conf']):.6f}"
-                        ),
+                    active.observation_count += 1
+                    should_write_observation = (
+                        active.observation_count == 1
+                        or (active.observation_count % observation_stride == 0)
                     )
-                    session.add(obs)
-                    total_observations_written += 1
-
-                    if args.animal_id and not active.association_created:
-                        assoc = Association(
-                            global_track_id=_build_global_track_id(
-                                args.global_id_mode,
-                                args.camera_id,
-                                source_track_id,
-                                args.animal_id,
+                    if should_write_observation:
+                        obs = TrackObservation(
+                            track_id=active.track_id,
+                            ts=now,
+                            bbox=json.dumps([round(float(v), 3) for v in det["bbox_xyxy"]], ensure_ascii=True),
+                            marker_id_read=None,
+                            appearance_vec_ref=(
+                                f"src:{source_track_id};class:{int(det['class_id'])};conf:{float(det['conf']):.6f}"
                             ),
+                        )
+                        session.add(obs)
+                        total_observations_written += 1
+
+                    if (
+                        args.animal_id
+                        and not active.association_created
+                        and active.observation_count >= min_track_observations
+                    ):
+                        global_track_id = _build_global_track_id(
+                            args.global_id_mode,
+                            args.camera_id,
+                            source_track_id,
+                            args.animal_id,
+                        )
+                        assoc = Association(
+                            global_track_id=global_track_id,
                             track_id=active.track_id,
                             animal_id=args.animal_id,
                             confidence=float(det["conf"]),
                             created_at=now,
                         )
                         session.add(assoc)
+                        _upsert_identity(
+                            session=session,
+                            global_track_id=global_track_id,
+                            animal_id=args.animal_id,
+                            source="manual",
+                            confidence=float(det["conf"]),
+                        )
                         active.association_created = True
-                    elif args.global_id_mode == "reid_auto" and not active.association_created:
+                    elif (
+                        args.global_id_mode == "reid_auto"
+                        and not active.association_created
+                        and active.observation_count >= min_track_observations
+                    ):
                         embedding = det.get("embedding")
                         if embedding:
                             global_track_id = _find_or_create_reid_global_id(
@@ -328,7 +389,23 @@ def run(args: argparse.Namespace) -> None:
                             created_at=now,
                         )
                         session.add(assoc)
+                        _upsert_identity(
+                            session=session,
+                            global_track_id=global_track_id,
+                            animal_id=args.animal_id if args.animal_id else None,
+                            source="reid_auto",
+                            confidence=float(det["conf"]),
+                        )
                         active.association_created = True
+
+                if track_stale_frames > 0:
+                    stale_ids = [
+                        source_id
+                        for source_id, active in active_tracks.items()
+                        if (frame_index - active.last_seen_frame) > track_stale_frames
+                    ]
+                    for source_id in stale_ids:
+                        active_tracks.pop(source_id, None)
 
                 frame_index += 1
                 processed_frames += 1
@@ -385,6 +462,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--iou-threshold", type=float, default=0.45)
     parser.add_argument("--classes-csv", default="15,16", help="COCO class IDs, default cat/dog")
     parser.add_argument("--frame-stride", type=int, default=1)
+    parser.add_argument(
+        "--observation-stride",
+        type=int,
+        default=1,
+        help="Persist one observation every N matched detections per track.",
+    )
+    parser.add_argument(
+        "--min-track-observations",
+        type=int,
+        default=2,
+        help="Create first association only after this many observations for the track.",
+    )
+    parser.add_argument(
+        "--track-stale-frames",
+        type=int,
+        default=90,
+        help="Drop active track state if not seen for this many processed frames (0 disables).",
+    )
     parser.add_argument("--commit-interval-frames", type=int, default=30)
     parser.add_argument("--reconnect-retries", type=int, default=20)
     parser.add_argument("--reconnect-delay-seconds", type=float, default=2.0)

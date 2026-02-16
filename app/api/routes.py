@@ -15,6 +15,7 @@ from app.db.models import (
     Collar,
     Event,
     ExportJob,
+    GlobalIdentity,
     MediaSegment,
     Position,
     Track,
@@ -33,6 +34,7 @@ from app.schemas.domain import (
     ExportJobCreate,
     ExportRequest,
     HighlightRequest,
+    IdentityUpsert,
     MediaSegmentCreate,
     PositionCreate,
     TrackCreate,
@@ -218,6 +220,38 @@ def list_associations(
     if global_track_id:
         query = query.where(Association.global_track_id == global_track_id)
     return list(session.exec(query.order_by(Association.created_at.desc())))
+
+
+@router.get("/identities/{global_track_id}")
+def get_identity(global_track_id: str, session: Session = Depends(get_session)) -> GlobalIdentity:
+    row = session.get(GlobalIdentity, global_track_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Identity not found")
+    return row
+
+
+@router.put("/identities/{global_track_id}/animal")
+def upsert_identity_animal(
+    global_track_id: str,
+    payload: IdentityUpsert,
+    session: Session = Depends(get_session),
+) -> GlobalIdentity:
+    if payload.state not in {"unknown", "confirmed"}:
+        raise HTTPException(status_code=400, detail="state must be one of: unknown, confirmed")
+    if payload.animal_id and not session.get(Animal, payload.animal_id):
+        raise HTTPException(status_code=404, detail="Animal not found")
+
+    row = session.get(GlobalIdentity, global_track_id)
+    if not row:
+        row = GlobalIdentity(global_track_id=global_track_id)
+    row.animal_id = payload.animal_id
+    row.state = payload.state
+    row.source = payload.source
+    row.updated_at = utcnow()
+    session.add(row)
+    session.commit()
+    session.refresh(row)
+    return row
 
 
 @router.post("/events")
@@ -705,11 +739,35 @@ def create_export_job(
     if mode not in {"full", "highlights"}:
         raise HTTPException(status_code=400, detail="mode must be one of: full, highlights")
 
+    if payload.max_retries < 0:
+        raise HTTPException(status_code=400, detail="max_retries must be >= 0")
+
+    payload_data = payload.model_dump(exclude={"mode", "dedupe", "max_retries"})
+    payload_json = json.dumps(payload_data, ensure_ascii=True)
+
+    if payload.dedupe:
+        existing_query = (
+            select(ExportJob)
+            .where(ExportJob.global_track_id == global_track_id)
+            .where(ExportJob.mode == mode)
+            .where(ExportJob.payload_json == payload_json)
+            .where(ExportJob.status.in_(["pending", "running"]))
+            .where(ExportJob.canceled_at.is_(None))
+            .order_by(ExportJob.created_at.desc())
+            .limit(1)
+        )
+        existing = session.exec(existing_query).first()
+        if existing:
+            return existing
+
     job = ExportJob(
         global_track_id=global_track_id,
         mode=mode,
         status="pending",
-        payload_json=json.dumps(payload.model_dump(), ensure_ascii=True),
+        payload_json=payload_json,
+        max_retries=payload.max_retries,
+        retry_count=0,
+        next_run_at=utcnow(),
     )
     session.add(job)
     session.commit()
@@ -722,6 +780,44 @@ def get_export_job(job_id: str, session: Session = Depends(get_session)) -> Expo
     job = session.get(ExportJob, job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Export job not found")
+    return job
+
+
+@router.post("/exports/jobs/{job_id}/cancel")
+def cancel_export_job(job_id: str, session: Session = Depends(get_session)) -> ExportJob:
+    job = session.get(ExportJob, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Export job not found")
+    if job.status in {"done", "failed", "canceled"}:
+        return job
+
+    job.status = "canceled"
+    job.canceled_at = utcnow()
+    job.next_run_at = None
+    session.add(job)
+    session.commit()
+    session.refresh(job)
+    return job
+
+
+@router.post("/exports/jobs/{job_id}/retry")
+def retry_export_job(job_id: str, session: Session = Depends(get_session)) -> ExportJob:
+    job = session.get(ExportJob, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Export job not found")
+    if job.status not in {"failed", "canceled"}:
+        raise HTTPException(status_code=400, detail="Only failed/canceled jobs can be retried")
+
+    job.status = "pending"
+    job.error_message = None
+    job.started_at = None
+    job.finished_at = None
+    job.canceled_at = None
+    job.next_run_at = utcnow()
+    job.retry_count = 0
+    session.add(job)
+    session.commit()
+    session.refresh(job)
     return job
 
 

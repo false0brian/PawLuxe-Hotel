@@ -106,3 +106,12 @@ class ExportJobCreate(BaseModel):
     render_video: bool = True
     target_seconds: float = 30.0
     per_clip_seconds: float = 4.0
+    timeout_seconds: float = 600.0
+    max_retries: int = 3
+    dedupe: bool = True
+
+
+class IdentityUpsert(BaseModel):
+    animal_id: str | None = None
+    state: str = "confirmed"
+    source: str = "manual"

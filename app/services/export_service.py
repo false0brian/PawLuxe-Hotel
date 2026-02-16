@@ -1,4 +1,5 @@
 import json
+import shutil
 import subprocess
 import uuid
 from collections import defaultdict
@@ -227,67 +228,77 @@ def save_manifest(global_track_id: str, summary: dict, excerpts: list[ExportExce
     return export_id, path
 
 
-def _run_ffmpeg(cmd: list[str]) -> None:
-    completed = subprocess.run(cmd, capture_output=True, text=True)
+def _run_ffmpeg(cmd: list[str], timeout_seconds: float | None = None) -> None:
+    timeout = None
+    if timeout_seconds is not None and timeout_seconds > 0:
+        timeout = timeout_seconds
+    completed = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     if completed.returncode != 0:
         raise RuntimeError(completed.stderr.strip() or "ffmpeg failed")
 
 
-def render_export_video(export_id: str, excerpts: list[ExportExcerpt]) -> Path:
+def render_export_video(
+    export_id: str,
+    excerpts: list[ExportExcerpt],
+    ffmpeg_timeout_seconds: float | None = None,
+) -> Path:
     _, videos_dir = _ensure_export_dirs()
     work_dir = videos_dir / f"{export_id}_parts"
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    part_paths: list[Path] = []
-    for idx, excerpt in enumerate(excerpts):
-        src = Path(excerpt.segment_path)
-        if not src.exists():
-            continue
+    try:
+        part_paths: list[Path] = []
+        for idx, excerpt in enumerate(excerpts):
+            src = Path(excerpt.segment_path)
+            if not src.exists():
+                continue
 
-        part = work_dir / f"part_{idx:04d}.mp4"
-        cmd = [
+            part = work_dir / f"part_{idx:04d}.mp4"
+            cmd = [
+                settings.ffmpeg_bin,
+                "-y",
+                "-ss",
+                f"{excerpt.offset_start_sec:.3f}",
+                "-i",
+                str(src),
+                "-t",
+                f"{excerpt.duration_sec:.3f}",
+                "-an",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "24",
+                str(part),
+            ]
+            _run_ffmpeg(cmd, timeout_seconds=ffmpeg_timeout_seconds)
+            part_paths.append(part)
+
+        if not part_paths:
+            raise RuntimeError("No valid segment files found to render")
+
+        concat_txt = work_dir / "concat.txt"
+        concat_txt.write_text("\n".join([f"file '{p.resolve()}'" for p in part_paths]), encoding="utf-8")
+
+        output = videos_dir / f"{export_id}.mp4"
+        cmd_concat = [
             settings.ffmpeg_bin,
             "-y",
-            "-ss",
-            f"{excerpt.offset_start_sec:.3f}",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
             "-i",
-            str(src),
-            "-t",
-            f"{excerpt.duration_sec:.3f}",
-            "-an",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "24",
-            str(part),
+            str(concat_txt),
+            "-c",
+            "copy",
+            str(output),
         ]
-        _run_ffmpeg(cmd)
-        part_paths.append(part)
-
-    if not part_paths:
-        raise RuntimeError("No valid segment files found to render")
-
-    concat_txt = work_dir / "concat.txt"
-    concat_txt.write_text("\n".join([f"file '{p.resolve()}'" for p in part_paths]), encoding="utf-8")
-
-    output = videos_dir / f"{export_id}.mp4"
-    cmd_concat = [
-        settings.ffmpeg_bin,
-        "-y",
-        "-f",
-        "concat",
-        "-safe",
-        "0",
-        "-i",
-        str(concat_txt),
-        "-c",
-        "copy",
-        str(output),
-    ]
-    _run_ffmpeg(cmd_concat)
-    return output
+        _run_ffmpeg(cmd_concat, timeout_seconds=ffmpeg_timeout_seconds)
+        return output
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 def manifest_path_for_export(export_id: str) -> Path:
