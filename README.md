@@ -16,6 +16,7 @@ FastAPI 기반 반려동물 멀티카메라 트래킹/저장/Export 백엔드입
 
 3. 저장
 - `tracks`, `track_observations`, `associations` 적재
+- `global_identities`로 `global_track_id -> animal_id` 확정/미확정 상태 관리
 - 옵션으로 원본 스트림을 세그먼트 MP4로 저장하고 `media_segments` 적재
 
 4. Export
@@ -52,6 +53,7 @@ FastAPI 기반 반려동물 멀티카메라 트래킹/저장/Export 백엔드입
 - `positions`
 - `associations`
 - `global_track_profiles`
+- `global_identities`
 - `events`
 - `media_segments`
 - `clips`
@@ -75,6 +77,40 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 pip install -r requirements-tracking.txt
 ```
 
+## PostgreSQL 전환
+로컬 Postgres 실행:
+```bash
+cd /home/brian/PawLuxe-Hotel
+docker compose -f docker-compose.postgres.yml up -d
+```
+
+`.env`에서 DB URL 변경:
+```env
+DATABASE_URL=postgresql+psycopg://pawluxe:pawluxe@127.0.0.1:5432/pawluxe
+```
+
+앱 재시작 시 SQLModel 테이블이 자동 생성됩니다.
+
+참고:
+- 기존 SQLite 데이터는 자동 마이그레이션되지 않습니다.
+- 운영 전환 시에는 데이터 이관 스크립트(또는 ETL) 별도 수행이 필요합니다.
+
+SQLite -> Postgres 이관 스크립트:
+```bash
+python scripts/migrate_sqlite_to_postgres.py \
+  --source sqlite:///./pawluxe.db \
+  --target postgresql+psycopg://pawluxe:pawluxe@127.0.0.1:5432/pawluxe \
+  --on-conflict skip
+```
+
+드라이런(쓰기 없이 카운트만 확인):
+```bash
+python scripts/migrate_sqlite_to_postgres.py \
+  --source sqlite:///./pawluxe.db \
+  --target postgresql+psycopg://pawluxe:pawluxe@127.0.0.1:5432/pawluxe \
+  --dry-run
+```
+
 ## 주요 API
 모든 `/api/v1/*`는 `x-api-key` 헤더 필요 (`GET /health` 제외).
 
@@ -91,6 +127,8 @@ pip install -r requirements-tracking.txt
 - `GET /api/v1/tracks/{track_id}/observations`
 - `POST /api/v1/associations`
 - `GET /api/v1/associations`
+- `GET /api/v1/identities/{global_track_id}`
+- `PUT /api/v1/identities/{global_track_id}/animal`
 - `POST /api/v1/events`
 - `GET /api/v1/events`
 - `POST /api/v1/positions`
@@ -110,6 +148,8 @@ Export:
 - `POST /api/v1/exports/global-track/{global_track_id}/highlights`
 - `POST /api/v1/exports/global-track/{global_track_id}/jobs`
 - `GET /api/v1/exports/jobs/{job_id}`
+- `POST /api/v1/exports/jobs/{job_id}/cancel`
+- `POST /api/v1/exports/jobs/{job_id}/retry`
 - `GET /api/v1/exports/{export_id}`
 
 ## RTSP 워커 실행
@@ -164,7 +204,7 @@ curl -X POST "http://localhost:8000/api/v1/exports/global-track/<global_track_id
 curl -X POST "http://localhost:8000/api/v1/exports/global-track/<global_track_id>/jobs" \
   -H "x-api-key: replace-with-strong-api-key" \
   -H "Content-Type: application/json" \
-  -d '{"mode":"highlights","padding_seconds":2.0,"target_seconds":30.0,"per_clip_seconds":4.0,"render_video":true}'
+  -d '{"mode":"highlights","padding_seconds":2.0,"target_seconds":30.0,"per_clip_seconds":4.0,"render_video":true,"timeout_seconds":600,"max_retries":3,"dedupe":true}'
 
 # 워커 실행
 python -m app.workers.export_job_worker
@@ -172,7 +212,19 @@ python -m app.workers.export_job_worker
 # 상태 조회
 curl -H "x-api-key: replace-with-strong-api-key" \
   "http://localhost:8000/api/v1/exports/jobs/<job_id>"
+
+# 취소
+curl -X POST -H "x-api-key: replace-with-strong-api-key" \
+  "http://localhost:8000/api/v1/exports/jobs/<job_id>/cancel"
+
+# 재시도(실패/취소 상태에서만 가능)
+curl -X POST -H "x-api-key: replace-with-strong-api-key" \
+  "http://localhost:8000/api/v1/exports/jobs/<job_id>/retry"
 ```
+
+`timeout_seconds`는 잡 전체 처리 시간 제한입니다. 초과 시 `TimeoutError`로 실패 처리되고, `max_retries` 범위 내에서 재시도됩니다.
+PostgreSQL에서는 워커가 `FOR UPDATE SKIP LOCKED`로 job을 클레임하여 다중 워커 동시 실행 시 중복 처리 가능성을 줄입니다.
+렌더링 완료 후에는 `storage/exports/videos/<export_id>_parts` 임시 디렉토리를 자동 정리합니다.
 
 다운로드:
 ```bash

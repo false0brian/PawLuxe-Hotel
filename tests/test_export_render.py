@@ -47,3 +47,37 @@ def test_render_export_video_if_ffmpeg_available(monkeypatch) -> None:
     assert out.exists()
     assert out.suffix == ".mp4"
     assert out.stat().st_size > 0
+
+
+def test_render_export_video_cleans_temp_parts_dir(monkeypatch) -> None:
+    suffix = str(uuid.uuid4())[:8]
+    src = Path("storage/uploads") / f"render-cleanup-src-{suffix}.mp4"
+    src.parent.mkdir(parents=True, exist_ok=True)
+    src.write_bytes(b"source")
+
+    now = export_service.datetime.now(export_service.timezone.utc)
+    excerpts = [
+        ExportExcerpt(
+            camera_id="cam-cleanup",
+            segment_id="seg-cleanup",
+            segment_path=str(src),
+            clip_start_ts=now,
+            clip_end_ts=now + timedelta(seconds=1.0),
+            offset_start_sec=0.0,
+            duration_sec=1.0,
+        )
+    ]
+
+    def _fake_run_ffmpeg(cmd: list[str], timeout_seconds: float | None = None) -> None:
+        out = Path(cmd[-1])
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(b"x")
+
+    monkeypatch.setattr(export_service, "_run_ffmpeg", _fake_run_ffmpeg)
+
+    export_id = f"render-cleanup-{suffix}"
+    out = render_export_video(export_id=export_id, excerpts=excerpts, ffmpeg_timeout_seconds=3.0)
+
+    assert out.exists()
+    parts_dir = Path("storage/exports/videos") / f"{export_id}_parts"
+    assert not parts_dir.exists()

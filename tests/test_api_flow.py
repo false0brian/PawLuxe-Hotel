@@ -78,6 +78,21 @@ def test_domain_flow_and_timeline() -> None:
     )
     assert association_resp.status_code == 200
 
+    identity_put_resp = client.put(
+        f"/api/v1/identities/{association_global_track_id}/animal",
+        json={"animal_id": animal_id, "state": "confirmed", "source": "manual"},
+        headers=HEADERS,
+    )
+    assert identity_put_resp.status_code == 200
+    assert identity_put_resp.json()["animal_id"] == animal_id
+
+    identity_get_resp = client.get(
+        f"/api/v1/identities/{association_global_track_id}",
+        headers=HEADERS,
+    )
+    assert identity_get_resp.status_code == 200
+    assert identity_get_resp.json()["global_track_id"] == association_global_track_id
+
     position_resp = client.post(
         "/api/v1/positions",
         json={"animal_id": animal_id, "x_m": 1.2, "y_m": 3.4, "method": "Uwb"},
@@ -174,3 +189,26 @@ def test_domain_flow_and_timeline() -> None:
     job_get_resp = client.get(f"/api/v1/exports/jobs/{job_id}", headers=HEADERS)
     assert job_get_resp.status_code == 200
     assert job_get_resp.json()["job_id"] == job_id
+
+    dedupe_resp = client.post(
+        f"/api/v1/exports/global-track/{association_global_track_id}/jobs",
+        json={
+            "mode": "highlights",
+            "padding_seconds": 1.0,
+            "target_seconds": 8.0,
+            "per_clip_seconds": 2.0,
+            "render_video": False,
+            "dedupe": True,
+        },
+        headers=HEADERS,
+    )
+    assert dedupe_resp.status_code == 200
+    assert dedupe_resp.json()["job_id"] == job_id
+
+    cancel_resp = client.post(f"/api/v1/exports/jobs/{job_id}/cancel", headers=HEADERS)
+    assert cancel_resp.status_code == 200
+    assert cancel_resp.json()["status"] == "canceled"
+
+    retry_resp = client.post(f"/api/v1/exports/jobs/{job_id}/retry", headers=HEADERS)
+    assert retry_resp.status_code == 200
+    assert retry_resp.json()["status"] == "pending"
